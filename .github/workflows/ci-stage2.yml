@@ -1,0 +1,69 @@
+name: CI Stage 2 — ephemeral staging (ACI)
+
+on:
+  workflow_run:
+    workflows: ["CI Stage 1"]
+    types: [completed]
+
+jobs:
+  staging:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
+    runs-on: ubuntu-latest
+    env:
+      RG: rg-sit722-10d
+      ACR_NAME: ${{ secrets.ACR_NAME }}
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+      IMAGE_REPO: sit722-backend
+      TAG: ${{ github.event.workflow_run.head_sha }}
+      DNS_LABEL: sit722-stg-${{ github.run_id }}
+
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Enable admin temporarily so ACI can pull from ACR; fetch creds
+      - name: Enable ACR admin & fetch creds
+        run: |
+          az acr update -n $ACR_NAME --admin-enabled true
+          USER=$(az acr credential show -n $ACR_NAME --query username -o tsv)
+          PASS=$(az acr credential show -n $ACR_NAME --query passwords[0].value -o tsv)
+          echo "ACR_USER=$USER" >> $GITHUB_ENV
+          echo "ACR_PASS=$PASS" >> $GITHUB_ENV
+
+      - name: Create ACI staging container
+        id: aci
+        run: |
+          az container create \
+            -g $RG \
+            -n $DNS_LABEL \
+            --image $ACR_LOGIN_SERVER/$IMAGE_REPO:$TAG \
+            --cpu 1 --memory 1 \
+            --ports 3000 \
+            --dns-name-label $DNS_LABEL \
+            --registry-login-server $ACR_LOGIN_SERVER \
+            --registry-username "$ACR_USER" \
+            --registry-password "$ACR_PASS"
+          FQDN=$(az container show -g $RG -n $DNS_LABEL --query ipAddress.fqdn -o tsv)
+          echo "FQDN=$FQDN" >> $GITHUB_OUTPUT
+          echo "Staging URL: http://$FQDN:3000"
+
+      - name: Health check
+        run: |
+          FQDN=$(az container show -g $RG -n $DNS_LABEL --query ipAddress.fqdn -o tsv)
+          echo "Waiting for $FQDN..."
+          for i in {1..30}; do
+            if curl -fsS "http://$FQDN:3000/healthz"; then
+              echo "Health check passed"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Health check failed"
+          exit 1
+
+      - name: Teardown staging
+        if: always()
+        run: |
+          az container delete -g $RG -n $DNS_LABEL --yes
