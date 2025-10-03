@@ -1,4 +1,4 @@
-name: CI Stage 2 — ephemeral staging (ACI)
+name: CI Stage 2
 
 on:
   workflow_run:
@@ -7,15 +7,18 @@ on:
 
 jobs:
   staging:
+    # only when Stage 1 succeeded on branch `testing`
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
     runs-on: ubuntu-latest
     env:
       RG: rg-sit722-10d
+      LOCATION: australiaeast
       ACR_NAME: ${{ secrets.ACR_NAME }}
       ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
       IMAGE_REPO: sit722-backend
       TAG: ${{ github.event.workflow_run.head_sha }}
-      DNS_LABEL: sit722-stg-${{ github.run_id }}
+      # make DNS label globally unique in region
+      DNS_LABEL: sit722stg-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Azure login
@@ -23,47 +26,58 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Enable admin temporarily so ACI can pull from ACR; fetch creds
-      - name: Enable ACR admin & fetch creds
+      - name: Enable ACR admin & fetch creds (for ACI pull)
         run: |
-          az acr update -n $ACR_NAME --admin-enabled true
-          USER=$(az acr credential show -n $ACR_NAME --query username -o tsv)
-          PASS=$(az acr credential show -n $ACR_NAME --query passwords[0].value -o tsv)
-          echo "ACR_USER=$USER" >> $GITHUB_ENV
-          echo "ACR_PASS=$PASS" >> $GITHUB_ENV
+          set -euo pipefail
+          az acr update -n "$ACR_NAME" --admin-enabled true
+          echo "ACR_USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)" >> $GITHUB_ENV
+          echo "ACR_PASS=$(az acr credential show -n "$ACR_NAME" --query passwords[0].value -o tsv)" >> $GITHUB_ENV
 
       - name: Create ACI staging container
-        id: aci
         run: |
+          set -euo pipefail
+          echo "Creating ACI in $LOCATION with image $ACR_LOGIN_SERVER/$IMAGE_REPO:$TAG"
           az container create \
-            -g $RG \
-            -n $DNS_LABEL \
-            --image $ACR_LOGIN_SERVER/$IMAGE_REPO:$TAG \
+            -g "$RG" \
+            -l "$LOCATION" \
+            -n "$DNS_LABEL" \
+            --image "$ACR_LOGIN_SERVER/$IMAGE_REPO:$TAG" \
             --cpu 1 --memory 1 \
+            --os-type Linux \
             --ports 3000 \
-            --dns-name-label $DNS_LABEL \
-            --registry-login-server $ACR_LOGIN_SERVER \
+            --ip-address Public \
+            --dns-name-label "$DNS_LABEL" \
+            --restart-policy Never \
+            --registry-login-server "$ACR_LOGIN_SERVER" \
             --registry-username "$ACR_USER" \
             --registry-password "$ACR_PASS"
-          FQDN=$(az container show -g $RG -n $DNS_LABEL --query ipAddress.fqdn -o tsv)
-          echo "FQDN=$FQDN" >> $GITHUB_OUTPUT
-          echo "Staging URL: http://$FQDN:3000"
 
-      - name: Health check
+          echo "Waiting for container to reach Running..."
+          az container wait -g "$RG" -n "$DNS_LABEL" --custom "instanceView.state=='Running'" --interval 10 --timeout 300
+
+          FQDN=$(az container show -g "$RG" -n "$DNS_LABEL" --query ipAddress.fqdn -o tsv)
+          echo "Staging URL: http://$FQDN:3000"
+          echo "FQDN=$FQDN" >> $GITHUB_ENV
+
+          echo "===== Recent container events ====="
+          az container show -g "$RG" -n "$DNS_LABEL" --query "containers[].instanceView.events[]" -o table || true
+
+      - name: Health check (/healthz)
         run: |
-          FQDN=$(az container show -g $RG -n $DNS_LABEL --query ipAddress.fqdn -o tsv)
-          echo "Waiting for $FQDN..."
+          set -euo pipefail
+          echo "Hitting http://$FQDN:3000/healthz ..."
           for i in {1..30}; do
             if curl -fsS "http://$FQDN:3000/healthz"; then
               echo "Health check passed"
               exit 0
             fi
+            echo "Attempt $i failed; retrying..."
             sleep 5
           done
-          echo "Health check failed"
+          echo "Health check failed after retries"
           exit 1
 
       - name: Teardown staging
         if: always()
         run: |
-          az container delete -g $RG -n $DNS_LABEL --yes
+          az container delete -g "$RG" -n "$DNS_LABEL" --yes
