@@ -7,16 +7,14 @@ on:
 
 jobs:
   staging:
+    # only run after CI Stage 1 succeeded on the 'testing' branch
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'testing' }}
     runs-on: ubuntu-latest
     env:
-      RG: rg-sit722-10d
-      LOCATION: australiaeast
       ACR_NAME: ${{ secrets.ACR_NAME }}
       ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
       IMAGE_REPO: sit722-backend
       TAG: ${{ github.event.workflow_run.head_sha }}
-      DNS_LABEL: sit722stg-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Azure login
@@ -24,56 +22,38 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Ensure ACI provider is registered
-        run: |
-          az provider register -n Microsoft.ContainerInstance --wait || true
-          az provider show -n Microsoft.ContainerInstance --query registrationState -o tsv
-
-      - name: Enable ACR admin & fetch creds
+      - name: Enable ACR admin & docker login
         run: |
           set -euo pipefail
           az acr update -n "$ACR_NAME" --admin-enabled true
-          echo "ACR_USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)" >> $GITHUB_ENV
-          echo "ACR_PASS=$(az acr credential show -n "$ACR_NAME" --query passwords[0].value -o tsv)" >> $GITHUB_ENV
+          USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
+          PASS=$(az acr credential show -n "$ACR_NAME" --query passwords[0].value -o tsv)
+          echo "$PASS" | docker login "$ACR_LOGIN_SERVER" -u "$USER" --password-stdin
 
-      - name: Create ACI staging container (Linux)
+      - name: Pull image from ACR
+        run: docker pull "$ACR_LOGIN_SERVER/$IMAGE_REPO:$TAG"
+
+      - name: Start staging container (ephemeral)
         run: |
-          set -euo pipefail
-          echo "Creating $DNS_LABEL in $LOCATION from $ACR_LOGIN_SERVER/$IMAGE_REPO:$TAG"
-          az container create \
-            -g "$RG" -l "$LOCATION" \
-            -n "${{ env.DNS_LABEL }}" \
-            --os-type Linux \
-            --image "${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPO }}:${{ env.TAG }}" \
-            --cpu 1 --memory 1 \
-            --ip-address Public --ports 3000 \
-            --dns-name-label "${{ env.DNS_LABEL }}" \
-            --registry-login-server "${{ env.ACR_LOGIN_SERVER }}" \
-            --registry-username "$ACR_USER" \
-            --registry-password "$ACR_PASS" \
-            --restart-policy Never
-
-          echo "Waiting for Running..."
-          az container wait -g "$RG" -n "${{ env.DNS_LABEL }}" --custom "instanceView.state=='Running'" --interval 10 --timeout 300
-
-          FQDN=$(az container show -g "$RG" -n "${{ env.DNS_LABEL }}" --query ipAddress.fqdn -o tsv)
-          echo "FQDN=$FQDN" >> $GITHUB_ENV
-          echo "Staging URL: http://$FQDN:3000"
+          docker run -d --rm --name staging -p 3000:3000 "$ACR_LOGIN_SERVER/$IMAGE_REPO:$TAG"
+          echo "Staging URL: http://localhost:3000"
+          # small warm-up
+          sleep 5
 
       - name: Health check (/healthz)
         run: |
-          set -euo pipefail
           for i in {1..30}; do
-            if curl -fsS "http://$FQDN:3000/healthz"; then
+            if curl -fsS http://localhost:3000/healthz; then
               echo "Health check passed"
               exit 0
             fi
             echo "Attempt $i failed; retrying..."
-            sleep 5
+            sleep 2
           done
-          echo "Health check failed"; exit 1
+          echo "--- Last 100 container logs ---"
+          docker logs --tail=100 staging || true
+          exit 1
 
       - name: Teardown staging
         if: always()
-        run: |
-          az container delete -g "$RG" -n "${{ env.DNS_LABEL }}" --yes || true
+        run: docker stop staging || true
