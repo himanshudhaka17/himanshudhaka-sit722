@@ -1,0 +1,8 @@
+FROM node:18-alpine
+WORKDIR /app
+COPY package.json ./
+RUN npm install --omit=dev || true
+COPY src ./src
+COPY tests ./tests
+EXPOSE 3000
+CMD ["node","src/server.js"]
